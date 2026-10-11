@@ -1,0 +1,56 @@
+{
+  "name": "dsh-font-master",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness 字体插件：中西文分别指定，界面 / 内容 / 代码三处独立。Set the CJK and Latin families separately, and the interface, content and code faces independently.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "font",
+    "font-family",
+    "typography",
+    "cjk",
+    "monospace"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "author": "AnAcretiondisk9986",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AnAcretiondisk9986/dsh-font-master.git"
+  },
+  "homepage": "https://github.com/AnAcretiondisk9986/dsh-font-master#readme",
+  "bugs": {
+    "url": "https://github.com/AnAcretiondisk9986/dsh-font-master/issues"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tools/test.mjs",
+    "pairings": "node tools/pairings.mjs",
+    "preview": "node tools/preview.mjs",
+    "measure": "node tools/measure.mjs"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.6"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

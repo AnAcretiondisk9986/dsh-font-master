@@ -1,0 +1,7 @@
+# Bundle layer contributed by dsh-font-master.
+# Applied by `dsh plugin --profile <name> add` into any profile that lists this
+# bundle. The row id doubles as the plugin's identity in the Loader tree; the
+# browser half rides on this same row (package.json declares `dsh.client`).
+- insert:
+    - id: dsh-font-master
+      name: dsh-font-master
