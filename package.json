@@ -31,6 +31,7 @@
   },
   "files": [
     "lib/index.js",
+    "lib/fonts.js",
     "lib/client.js",
     "cordis.patch.yml",
     "README.md",
@@ -39,6 +40,7 @@
   "scripts": {
     "test": "node tools/test.mjs",
     "pairings": "node tools/pairings.mjs",
+    "picker": "node tools/preview-picker.mjs",
     "preview": "node tools/preview.mjs",
     "measure": "node tools/measure.mjs"
   },

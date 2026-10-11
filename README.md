@@ -12,6 +12,11 @@ Harness 官方的「设置 → 通用」只有配色和字号，没有字体族�
 | **文种** | 西文 / 中文 | 一句话里两种字：拉丁字母走西文字体，汉字走中文字体 |
 | **用途** | 界面 / 内容 / 代码 | 侧栏外壳、会话正文、代码等宽区各用各的，互不牵制 |
 
+字体选择是 Word 式的：**菜单列出这台机器上装的全部字体族**，每一行用它自己的字面渲染，
+按中文 / 等宽 / 西文分组，中英文名都能搜，并记住最近用过的几个。
+
+![字体菜单](docs/picker.png)
+
 设置位置：**设置 → 字体 / Fonts**，共 6 个槽位（3 处用途 × 2 个文种）。
 
 ---
@@ -57,6 +62,43 @@ Harness 官方的「设置 → 通用」只有配色和字号，没有字体族�
 代码块、行内代码、diff、JSON 树始终走代码字体，不会被内容字体压掉。
 
 「跟随界面字体」开关可以让内容字体直接沿用界面字体——只想换一处时不用填两遍。
+
+---
+
+## 字体菜单列的是本机字体表
+
+Word 的字体下拉之所以好用，是因为它列的就是这台机器上真实装了的字体。浏览器默认做不到：
+`queryLocalFonts()` 要先弹权限框，而且部分 Electron 构建根本不支持。
+
+所以清单由**宿主半侧读字体文件**得到：
+
+1. 按平台扫字体目录 —— Windows 是 `%WINDIR%\Fonts` 加 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`，
+   macOS 是 `/System/Library/Fonts`、`/Library/Fonts`、`~/Library/Fonts`，Linux 是
+   `/usr/share/fonts` 等。
+2. 逐个读 sfnt 结构：从 `name` 表取字体族名（优先 16 号排版族名，退回 1 号族名），
+   并把**每一条本地化记录都收作搜索别名**——所以搜「雅黑」和搜「YaHei」都能找到 `Microsoft YaHei`。
+3. 顺带读 `OS/2` 与 `post` 给字体打标签：中文（`ulUnicodeRange2` 的 CJK 位）、
+   衬线/无衬线（PANOSE）、等宽（`post.isFixedPitch`）。
+4. 同一个族的多套字面（Regular / Bold / Italic）合并成一条，列出时正体在前。
+5. 结果按目录内容指纹缓存到 `$DSH_HOME/dsh-font-master/fonts.json`，
+   字体没增删就不重扫，正常启动只走一次目录遍历；界面上也有「重新扫描」。
+
+只读取头部的几百个字节，不会把 20MB 的中文集全部读进来——本机 260 个字体文件、157 个字体族，
+整轮扫描约 55ms。
+
+清单通过一条 HTTP 路由（`/dsh-font-master/fonts`）交给浏览器半侧，路由套用与 Web 界面其余部分
+相同的信任检查。桌面端渲染进程的 origin 是 `dsh-app://app`，该协议的处理器会把非静态资源
+**带鉴权 cookie 转发**到本地 HTTP 服务，所以相对路径 `fetch` 在桌面端和 `dsh web` 下同样有效。
+
+拿不到清单时（没有 web server 的组合、路由被拒、响应为空）会退回一份内置候选表，
+并清楚标明「读不到本机字体清单」——菜单永远可用，只是不再完整。
+
+### 等宽判定为什么不用 PANOSE
+
+PANOSE 里有一个「proportion = 9」表示等宽。但中文字体普遍会把它标成 9，因为汉字本来就是全角——
+本机的 `SimHei`、`KaiTi`、`FangSong` 都是这样，照搬会把一堆正文宋黑体塞进代码字体候选。
+`post.isFixedPitch` 是字体对自己拉丁字宽的自述，用它才是对的；只有在字体没有 `post` 表时
+才退回 PANOSE。这条实测踩过，测试里也钉住了。
 
 ---
 
@@ -181,16 +223,22 @@ CSS Modules 的类名在 shell 里形如 `_plainRun_fbulu_6`、在运行时插�
 
 ## 验证
 
-### 1. 单元、冒烟与集成测试（50 项）
+### 1. 单元、冒烟与集成测试（77 项）
 
 ```sh
 node tools/test.mjs
 ```
 
-按客户端模块系统的方式加载 `lib/client.js`，断言字体栈构造、CSS 生成、状态归一化；
-再用假 `ctx` + 假 React + 假 DOM 把浏览器半侧**真跑一遍**——注册设置页、渲染整棵组件树、
-改字体槽、切「跟随界面字体」、点「恢复默认」，检查落盘的状态与重新发布的样式表；
-最后拿 `test/fixtures/` 里真实的 `ui-theme` 样式表核对插件依赖的每一个 token。
+- 按客户端模块系统的方式加载 `lib/client.js`，断言字体栈构造、CSS 生成、状态归一化；
+- 用假 `ctx` + 带状态的假 React + 假 DOM 把浏览器半侧**真跑一遍**：渲染整棵组件树、
+  打开字体菜单、按中文名搜索、选中一项、检查落盘状态与重新发布的样式表、
+  切「跟随界面字体」、点「恢复默认」；
+- 用 `fetch` 桩驱动字体清单的四条路径：成功、失败、非 200、空清单，
+  以及重新扫描与并发合并；
+- 宿主字体解析器用的是**合成字体**（`test/font-fixtures.mjs` 现造 sfnt 与 `ttcf` 字节），
+  所以不依赖跑测试的机器上装了什么：族名优先级、本地化别名、CJK 位、PANOSE 衬线判定、
+  `post.isFixedPitch` 等宽判定、集合字体多字面、非字体文件、缓存失效都被钉住；
+- 最后拿 `test/fixtures/` 里真实的 `ui-theme` 样式表核对插件依赖的每一个 token。
 
 ### 2. 级联实测
 
@@ -227,9 +275,14 @@ DSH 0.2.0-rc.2 desktop profile 实测：装为 bundle 后 `plugin_manager` 报�
 
 ## 已知边界
 
-- **字体必须已安装在本机**。下拉里带「（本机未检测到）」的项仍然可选——那是留给「你打算装」的场景；
-  浏览器找不到就按回退链往下走，不会报错。检测方式是对三个通用族做画布宽度对比
-  （`document.fonts.check()` 会把回退字体报成存在，`queryLocalFonts()` 又要权限弹窗，都不合适）。
+- **菜单列的是「这台机器装了哪些字体」**，字体本身仍要已安装——插件不含任何字体文件，
+  只是把字体名字符串交给浏览器。拿不到本机清单时会退回内置候选表，那一份里没装的项会标成
+  「未安装」（对三个通用族做画布宽度对比探测：`document.fonts.check()` 会把回退字体报成存在，
+  `queryLocalFonts()` 又要权限弹窗，都不适合做这件事）。
+- **清单只覆盖 sfnt 系**（`.ttf` / `.otf` / `.ttc` / `.otc`）。旧的 `.fon` 位图字体与
+  `.CompositeFont` 描述文件被跳过；`.woff` / `.woff2` 是网页字体，不属于已安装字体。
+- 宿主扫的是**运行 `dsh` 的那台机器**。用远程浏览器连过来时，菜单里列的是宿主机的字体而不是
+  访问者本机的——这与 Harness 其它「列表来自主机」的行为一致。
 - **不打包任何字体文件**，仓库里只有代码和字体名字符串。字体授权（尤其商用）请自行确认。
   特别地，不要把 SF Pro / SF Mono、Segoe UI、苹方、微软雅黑等系统字体随包再分发。
 - **终端（xterm）面板不在范围内**：它硬编码了字号并按自测字符宽度算 cols / rows，纯 CSS 换字体会让网格错位。
@@ -241,14 +294,14 @@ DSH 0.2.0-rc.2 desktop profile 实测：装为 bundle 后 `plugin_manager` 报�
 
 ## 开发
 
-无构建步骤：直接改 `lib/client.js` / `lib/index.js`。link 安装的 checkout 由 HMR 重载，
-改 `version` 才需要重启。
+无构建步骤：直接改 `lib/*.js`。link 安装的 checkout 由 HMR 重载，改 `version` 才需要重启。
 
 ```sh
-node tools/test.mjs          # 断言套件
-node tools/pairings.mjs      # 中西文搭配展示页  → docs/pairings.png
-node tools/preview.mjs       # 换成/不装插件对照页 → docs/preview-plugin.png
-node tools/measure.mjs       # 计算字体与渲染宽度实测 → docs/measure-plugin.png
+node tools/test.mjs            # 断言套件
+node tools/pairings.mjs        # 中西文搭配展示页   → docs/pairings.png
+node tools/preview-picker.mjs  # 字体菜单渲染页     → docs/picker.png
+node tools/preview.mjs         # 装/不装插件对照页   → docs/preview-plugin.png
+node tools/measure.mjs         # 计算字体与宽度实测 → docs/measure-plugin.png
 ```
 
 生成器写进 `test/out/`（已 gitignore），`docs/` 里只放提纯后的截图。截图用无头浏览器：
@@ -259,14 +312,19 @@ msedge --headless=new --disable-gpu --hide-scrollbars --force-device-scale-facto
   "file:///<仓库>/test/out/pairings.html"
 ```
 
+`tools/preview-picker.mjs` 不是画界面示意：它调用**插件自己的组件**（配 `tools/render-tree.mjs`
+把描述树序列化成 HTML）、喂进**真实枚举出来的字体清单**、再套上插件自己的样式表与 DSH 的主题令牌，
+所以那张截图就是浏览器半侧会渲染出来的东西。
+
 测试做四件事：
 
 1. 按客户端模块系统的方式加载 `lib/client.js`（`window.__ModuleLoader__` + 桩 `require`），
    对字体栈构造、CSS 生成、状态归一化逐条断言；
-2. 用假 `ctx` + 假 React + 假 DOM 跑一遍浏览器半侧：设置页能渲染出 3 张卡片 / 6 个字体槽、
-   改槽位会落盘并重发样式表、跟随开关会增删正文 token、恢复默认会清空输出；
-3. 拿 `test/fixtures/` 里真实的 `ui-theme` 样式表核对：插件重写的 14 个 Markdown 简写
-   仍然存在、仍然有四个长属性、末端仍然钉在 `var(--dsw-font-family)`；
+2. 用假 `ctx` + 带状态的假 React + 假 DOM 跑一遍浏览器半侧：设置页渲染出 3 张卡片 / 6 个字体槽、
+   菜单能开能搜能选、改槽位会落盘并重发样式表、跟随开关会增删正文 token、恢复默认会清空输出；
+3. 用合成字体测宿主解析器（不依赖本机装了什么），并拿 `test/fixtures/` 里真实的 `ui-theme`
+   样式表核对：插件重写的 14 个 Markdown 简写仍然存在、仍然有四个长属性、
+   末端仍然钉在 `var(--dsw-font-family)`；
 4. 包装契约：包名 = Loader 行 id = 模块 id、`exports["./client"]` 存在、引导脚本读的 key
    与浏览器半侧写的 key 一致、注入的脚本里没有 `</script>`、没有打包任何字体二进制；
    外加生成的样式表本身要被检查——每条声明都以 `;` 收尾且形如 `--prop:value`，
@@ -282,13 +340,15 @@ msedge --headless=new --disable-gpu --hide-scrollbars --force-device-scale-facto
 ### 目录
 
 ```
-package.json          dsh.bundle.patch + dsh.client 两半侧声明
-cordis.patch.yml      组合包层：插入插件行
-lib/index.js          宿主半侧：Config 无、只做首屏引导注入
-lib/client.js         浏览器半侧：字体栈构造 + 设置页（无构建）
-tools/                零依赖纯 Node：测试与三个展示页生成器
-test/fixtures/        从 app.asar 导出的样式表基准
-docs/                 截图
+package.json                 dsh.bundle.patch + dsh.client 两半侧声明
+cordis.patch.yml             组合包层：插入插件行
+lib/index.js                 宿主半侧：首屏引导注入 + 字体清单路由
+lib/fonts.js                 宿主半侧：字体目录扫描与 sfnt / ttcf 解析（零依赖）
+lib/client.js                浏览器半侧：字体栈构造 + 设置页与字体菜单（无构建）
+tools/                       零依赖纯 Node：测试、树渲染器与四个展示页生成器
+test/font-fixtures.mjs       合成字体字节，供解析器测试
+test/fixtures/               从 app.asar 导出的样式表基准
+docs/                        截图
 ```
 
 ---

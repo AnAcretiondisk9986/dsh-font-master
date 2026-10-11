@@ -16,8 +16,12 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fakeClientContext, loadClient, root } from "./load-client.mjs";
+import { collect, renderTree, toHtml } from "./render-tree.mjs";
+import { buildCollection, buildFont } from "../test/font-fixtures.mjs";
+import { enumerateFonts, fontDirectories, readFontFile } from "../lib/fonts.js";
 
 let passed = 0;
 const failures = [];
@@ -30,6 +34,22 @@ const failures = [];
 function check(name, fn) {
 	try {
 		fn();
+		passed += 1;
+		console.log(`  ok   ${name}`);
+	} catch (error) {
+		failures.push({ name, error });
+		console.log(`  FAIL ${name}\n       ${error.message}`);
+	}
+}
+
+/**
+ * Run one asynchronous check.
+ * @param name - human-readable check name.
+ * @param fn - the async assertion body.
+ */
+async function checkAsync(name, fn) {
+	try {
+		await fn();
 		passed += 1;
 		console.log(`  ok   ${name}`);
 	} catch (error) {
@@ -257,59 +277,22 @@ check("absurdly long input is truncated", () => {
 console.log("\n[browser half smoke test]");
 
 /**
- * Flatten arbitrarily nested child arrays, which is how `map`-produced children
- * arrive from the React stub.
- * @param value - any array.
- * @returns a flat array.
- */
-function flatten(value) {
-	return Array.isArray(value) ? value.flat(Infinity).filter(Boolean) : [value].filter(Boolean);
-}
-
-/**
- * Expand the React stub's descriptors into a plain tree, invoking function
- * components so nested children are exercised too.
- * @param node - a descriptor, array, or primitive.
- * @returns the expanded tree (elements only).
- */
-function renderTree(node) {
-	if (node === null || node === undefined || typeof node === "boolean") return null;
-	if (Array.isArray(node)) return flatten(node.map(renderTree));
-	if (typeof node === "string" || typeof node === "number") return node;
-	if (typeof node.type === "function") return renderTree(node.type(node.props || {}));
-	return {
-		type: node.type,
-		props: node.props || {},
-		children: flatten((node.children || []).map(renderTree)),
-	};
-}
-
-/**
- * Collect every element of one tag in a rendered tree.
- * @param tree - a rendered tree.
- * @param tag - the tag to collect.
- * @returns the matching nodes.
- */
-function collect(tree, tag) {
-	if (tree === null || typeof tree !== "object") return [];
-	if (Array.isArray(tree)) return tree.flatMap((child) => collect(child, tag));
-	const here = tree.type === tag ? [tree] : [];
-	return here.concat(flatten((tree.children || []).map((child) => collect(child, tag))));
-}
-
-/**
  * Load a fresh browser half, run its `apply` against a recording context, and
  * expose a re-render helper so a check can observe the page after a change.
+ * @param options - `props` render the page with, plus `loadClient` options.
  * @returns the loaded module, the context record, the registration and a render function.
  */
-function bootSettingsPage() {
-	const client = loadClient();
+function bootSettingsPage(options = {}) {
+	const client = loadClient(options);
 	const { ctx, registered } = fakeClientContext();
 	client.exports.apply(ctx);
 	const registration = registered.slotRegistrations[0];
 	if (!registration) throw new Error("apply registered no settings page");
-	/** Render the page as React would, expanding nested components. */
-	const render = (props) => renderTree(registration.component(props || {}));
+	/** Render the page as React would, expanding nested components and their hooks. */
+	const render = (props) => renderTree(
+		{ type: registration.component, props: props || options.props || {}, children: [] },
+		client.renderComponent,
+	);
 	return { client, registered, registration, render, tree: render() };
 }
 
@@ -321,6 +304,16 @@ function textInputs(tree) {
 /** The content group's follow-the-interface checkbox. */
 function followCheckbox(tree) {
 	return collect(tree, "input").find((node) => node.props.type === "checkbox");
+}
+
+/**
+ * The label a rendered menu option shows.
+ * @param option - a rendered `role="option"` button.
+ * @returns the family label text.
+ */
+function optionLabel(option) {
+	const name = option.children.find((child) => child && child.props && child.props.className === "dfm-optionName");
+	return name ? name.children[0] : null;
 }
 
 check("apply registers one settings page and one dictionary", () => {
@@ -335,29 +328,92 @@ check("apply registers one settings page and one dictionary", () => {
 	assert.ok(registered.locales[0].dictionaries.zh && registered.locales[0].dictionaries.en);
 });
 
-check("the settings page renders three cards, six slots and six inputs", () => {
+check("the settings page renders three cards and six font pickers", () => {
 	const { tree } = bootSettingsPage();
 	assert.equal(tree.type, "div");
 	assert.equal(collect(tree, "section").length, 3, "one card per group");
-	assert.equal(collect(tree, "select").length, 6, "latin + CJK for each of three groups");
-	assert.equal(textInputs(tree).length, 6);
+	assert.equal(textInputs(tree).length, 6, "latin + CJK for each of three groups");
+	assert.equal(collect(tree, "button").filter((node) => node.props.className === "dfm-caret").length, 6);
+	assert.equal(collect(tree, "div").filter((node) => node.props.className === "dfm-picker").length, 6);
 	assert.ok(followCheckbox(tree), "the content group offers follow-the-interface");
 });
 
-check("the catalogue is actually offered in the pickers", () => {
+check("no dropdown is rendered until a picker is opened", () => {
 	const { tree } = bootSettingsPage();
-	const values = new Set(collect(tree, "option").map((node) => node.props.value));
-	assert.ok(values.has("Segoe UI"), "no Latin families offered");
-	assert.ok(values.has("微软雅黑"), "no CJK families offered");
-	assert.ok(values.has("Consolas"), "no monospace families offered");
-	assert.ok(collect(tree, "optgroup").length > 0, "options are not grouped");
+	assert.equal(collect(tree, "div").filter((node) => node.props.className === "dfm-menu").length, 0);
+});
+
+check("opening a picker lists every installed family, grouped, in its own face", () => {
+	const { render, tree } = bootSettingsPage();
+	const latinInput = textInputs(tree)[0];
+	latinInput.props.onFocus();
+	const next = render();
+	const menu = collect(next, "div").find((node) => node.props.className === "dfm-menu");
+	assert.ok(menu, "the picker did not open");
+	const options = collect(next, "button").filter((node) => node.props.role === "option");
+	assert.ok(options.length > 40, `expected the built-in catalogue, got ${options.length}`);
+	const groups = collect(next, "div").filter((node) => node.props.className === "dfm-menuGroup")
+		.map((node) => node.children[0]);
+	assert.deepEqual(plain(groups), ["西文", "中文", "等宽"], "a Latin slot leads with Latin faces");
+	// Each row paints itself in the family it offers.
+	assert.ok(options.some((node) => node.props.style.fontFamily.includes("'Segoe UI'")));
+	assert.ok(options.some((node) => node.props.style.fontFamily.includes("'微软雅黑'")));
+});
+
+check("a code slot leads with monospace faces", () => {
+	const { render, tree } = bootSettingsPage();
+	textInputs(tree)[4].props.onFocus();
+	const groups = collect(render(), "div")
+		.filter((node) => node.props.className === "dfm-menuGroup")
+		.map((node) => node.children[0]);
+	assert.deepEqual(plain(groups), ["等宽", "中文", "西文"]);
+});
+
+check("typing filters the list and picking fills the field", () => {
+	const { render, tree } = bootSettingsPage();
+	const input = textInputs(tree)[0];
+	input.props.onFocus();
+	let options = collect(render(), "button").filter((node) => node.props.role === "option");
+	assert.ok(options.length > 40);
+
+	// Search by the localised name: the alias list has to be consulted.
+	textInputs(render())[0].props.onChange({ target: { value: "雅黑" } });
+	options = collect(render(), "button").filter((node) => node.props.role === "option");
+	assert.ok(options.length >= 1 && options.length < 6, `expected a narrow match, got ${options.length}`);
+	assert.equal(optionLabel(options[0]), "微软雅黑");
+
+	options[0].props.onClick();
+	assert.equal(textInputs(render())[0].props.value, "微软雅黑");
+});
+
+check("a pick is remembered in the recently-used group", () => {
+	const { client, render, tree } = bootSettingsPage();
+	const input = textInputs(tree)[0];
+	input.props.onFocus();
+	const options = collect(render(), "button").filter((node) => node.props.role === "option");
+	const georgia = options.find((node) => optionLabel(node) === "Georgia");
+	assert.ok(georgia, "Georgia missing from the catalogue");
+	georgia.props.onClick();
+
+	assert.deepEqual(JSON.parse(client.storage.get("dsh-font-master:v1")).recent, ["Georgia"]);
+	textInputs(render())[0].props.onFocus();
+	const groups = collect(render(), "div")
+		.filter((node) => node.props.className === "dfm-menuGroup")
+		.map((node) => node.children[0]);
+	assert.equal(groups[0], "最近使用");
+});
+
+check("a search with no matches says so instead of rendering nothing", () => {
+	const { render, tree } = bootSettingsPage();
+	textInputs(tree)[0].props.onFocus();
+	textInputs(render())[0].props.onChange({ target: { value: "zzzz-no-such-font" } });
+	assert.equal(collect(render(), "button").filter((node) => node.props.role === "option").length, 0);
+	const empty = collect(render(), "div").find((node) => node.props.className === "dfm-menuEmpty");
+	assert.ok(empty, "no empty-state message");
 });
 
 check("the page renders through a host translator when one is supplied", () => {
-	const client = loadClient();
-	const { ctx, registered } = fakeClientContext();
-	client.exports.apply(ctx);
-	const tree = renderTree(registered.slotRegistrations[0].component({ t: (key) => "T:" + key }));
+	const { tree } = bootSettingsPage({ props: { t: (key) => "T:" + key } });
 	const titles = collect(tree, "h3").map((node) => node.children[0]);
 	assert.deepEqual(plain(titles), ["T:group.ui.title", "T:group.content.title", "T:group.code.title"]);
 });
@@ -418,15 +474,16 @@ check("reset restores the default and clears the published stylesheet", () => {
 	textInputs(tree)[0].props.onChange({ target: { value: "Inter" } });
 	assert.notEqual(client.storage.get("dsh-font-master:css"), "");
 
-	const buttons = collect(render(), "button");
-	assert.equal(buttons.length, 1, "expected the single reset button");
-	buttons[0].props.onClick();
+	const reset = collect(render(), "button").find((node) => node.props.className === "dfm-button");
+	assert.ok(reset, "expected the reset button");
+	reset.props.onClick();
 	assert.equal(client.storage.get("dsh-font-master:css"), "", "reset must publish nothing");
 	assert.deepEqual(JSON.parse(client.storage.get("dsh-font-master:v1")), {
 		v: 1,
 		ui: { latin: "", cjk: "" },
 		content: { follow: true, latin: "", cjk: "" },
 		code: { latin: "", cjk: "" },
+		recent: [],
 	});
 });
 
@@ -451,6 +508,325 @@ check("a previously stored state is restored on the next boot", () => {
 	assert.ok(css.includes("--ds-font-family-code:'Consolas'"));
 	assert.ok(css.includes("--dsw-font-markdown-base:"));
 });
+
+// ---------------------------------------------------------------------------
+console.log("\n[installed-font catalogue]");
+
+/**
+ * A `fetch` stand-in for the host fonts route.
+ * @param payload - the JSON body to answer with.
+ * @param options - `ok` / `status` / `reject` control the outcome.
+ * @returns the stub, carrying its recorded calls.
+ */
+function fetchStub(payload, options = {}) {
+	const calls = [];
+	const stub = (url, init) => {
+		calls.push({ url, init });
+		if (options.reject) return Promise.reject(new Error(options.reject));
+		return Promise.resolve({
+			ok: options.ok !== false,
+			status: options.status === undefined ? 200 : options.status,
+			json: () => Promise.resolve(payload),
+		});
+	};
+	stub.calls = calls;
+	return stub;
+}
+
+/** A host-shaped family record. */
+const hostFamily = (name, extra = {}) => Object.assign({
+	name,
+	zh: null,
+	aliases: [name],
+	cjk: false,
+	mono: false,
+	serif: null,
+}, extra);
+
+await checkAsync("a host answer replaces the built-in list", async () => {
+	const fetch = fetchStub({ families: [hostFamily("Alpha Sans"), hostFamily("Beta Serif")], scannedAt: 123 });
+	const client = loadClient({ fetch });
+	client.exports.apply(fakeClientContext().ctx);
+	await client.internals.loadCatalogue(false);
+	const snapshot = client.internals.getCatalogue();
+	assert.equal(snapshot.status, "ready");
+	assert.equal(snapshot.source, "host");
+	assert.equal(snapshot.families.length, 2);
+	assert.equal(snapshot.scannedAt, 123);
+	assert.equal(fetch.calls[0].url, client.internals.FONTS_ENDPOINT);
+	assert.deepEqual(plain(fetch.calls[0].init), { credentials: "same-origin" });
+});
+
+await checkAsync("a failing route falls back to the built-in list", async () => {
+	const fetch = fetchStub(null, { reject: "boom" });
+	const client = loadClient({ fetch });
+	client.exports.apply(fakeClientContext().ctx);
+	await client.internals.loadCatalogue(false);
+	const snapshot = client.internals.getCatalogue();
+	assert.equal(snapshot.status, "fallback");
+	assert.equal(snapshot.source, "builtin");
+	assert.ok(snapshot.families.some((family) => family.name === "Segoe UI"), "fallback list is not the built-in one");
+});
+
+await checkAsync("an empty catalogue counts as a failure rather than an empty picker", async () => {
+	const fetch = fetchStub({ families: [] });
+	const client = loadClient({ fetch });
+	client.exports.apply(fakeClientContext().ctx);
+	await client.internals.loadCatalogue(false);
+	assert.equal(client.internals.getCatalogue().status, "fallback");
+});
+
+await checkAsync("a non-OK status falls back too", async () => {
+	const fetch = fetchStub({ families: [hostFamily("Alpha")] }, { ok: false, status: 401 });
+	const client = loadClient({ fetch });
+	client.exports.apply(fakeClientContext().ctx);
+	await client.internals.loadCatalogue(false);
+	assert.equal(client.internals.getCatalogue().status, "fallback");
+});
+
+await checkAsync("a rescan asks the host for a fresh scan", async () => {
+	const fetch = fetchStub({ families: [hostFamily("Alpha")] });
+	const client = loadClient({ fetch });
+	client.exports.apply(fakeClientContext().ctx);
+	await client.internals.loadCatalogue(false);
+	await client.internals.loadCatalogue(true);
+	assert.equal(fetch.calls.length, 2, "the second call must not be coalesced away");
+	assert.ok(fetch.calls[1].url.endsWith("?refresh=1"), fetch.calls[1].url);
+});
+
+await checkAsync("concurrent loads share one request", async () => {
+	const fetch = fetchStub({ families: [hostFamily("Alpha")] });
+	const client = loadClient({ fetch });
+	client.exports.apply(fakeClientContext().ctx);
+	await Promise.all([client.internals.loadCatalogue(true), client.internals.loadCatalogue(true)]);
+	assert.equal(fetch.calls.length, 1, "two callers started two scans");
+});
+
+await checkAsync("rendering without fetch still yields a usable picker", async () => {
+	const client = loadClient();
+	client.exports.apply(fakeClientContext().ctx);
+	await client.internals.loadCatalogue(false);
+	const snapshot = client.internals.getCatalogue();
+	assert.equal(snapshot.status, "fallback");
+	assert.ok(snapshot.families.length > 50);
+});
+
+check("malformed host records are dropped and the rest are coerced", () => {
+	const { normalizeFamily } = I;
+	assert.equal(normalizeFamily(null), null);
+	assert.equal(normalizeFamily({}), null);
+	assert.equal(normalizeFamily({ name: "   " }), null);
+	assert.equal(normalizeFamily({ name: "x".repeat(500) }), null);
+	const record = normalizeFamily({ name: " Alpha ", zh: 7, aliases: ["Alpha", 9, ""], cjk: 1, mono: true, serif: "yes" });
+	assert.equal(record.name, "Alpha");
+	assert.equal(record.zh, null, "a non-string localisation must not survive");
+	assert.deepEqual(plain(record.aliases), ["Alpha"]);
+	assert.equal(record.cjk, false, "only a real boolean counts");
+	assert.equal(record.mono, true);
+	assert.equal(record.serif, null);
+	assert.equal(record.installed, true, "host-enumerated families are installed by construction");
+});
+
+check("search matches the family name, the localisation and the aliases", () => {
+	const { matchFamily } = I;
+	const family = { name: "Microsoft YaHei", zh: "微软雅黑", aliases: ["Microsoft YaHei", "微软雅黑", "MSYH"] };
+	assert.equal(matchFamily(family, ""), true);
+	assert.equal(matchFamily(family, "yahei"), true, "case-insensitive name match");
+	assert.equal(matchFamily(family, "雅黑"), true, "localised-name match");
+	assert.equal(matchFamily(family, "MSYH"), true, "alias match");
+	assert.equal(matchFamily(family, "consolas"), false);
+});
+
+check("each slot leads with its own kind of face", () => {
+	const { bucketOrder } = I;
+	assert.deepEqual(plain(bucketOrder("latin", false)), ["latin", "cjk", "mono"]);
+	assert.deepEqual(plain(bucketOrder("cjk", false)), ["cjk", "latin", "mono"]);
+	assert.deepEqual(plain(bucketOrder("latin", true)), ["mono", "cjk", "latin"]);
+});
+
+check("rows group by kind, honour recents, and index every item", () => {
+	const { buildRows } = I;
+	const families = [
+		{ name: "Arial", zh: null, aliases: [], cjk: false, mono: false, serif: false },
+		{ name: "Georgia", zh: null, aliases: [], cjk: false, mono: false, serif: true },
+		{ name: "Consolas", zh: null, aliases: [], cjk: false, mono: true, serif: false },
+		{ name: "Microsoft YaHei", zh: "微软雅黑", aliases: [], cjk: true, mono: false, serif: false },
+	];
+	const tr = (key) => key;
+	const rows = buildRows(families, "", "latin", false, ["Georgia"], tr);
+	assert.deepEqual(plain(rows.filter((row) => row.type === "group").map((row) => row.label)),
+		["picker.recent", "picker.latin", "picker.cjk", "picker.mono"]);
+	assert.equal(rows.filter((row) => row.type === "item").length, 4, "recents must not be listed twice");
+	assert.deepEqual(plain(rows.filter((row) => row.type === "item").map((row) => row.index)), [0, 1, 2, 3]);
+
+	const searched = buildRows(families, "雅黑", "latin", false, [], tr);
+	assert.equal(searched.length, 1);
+	assert.equal(searched[0].family.name, "Microsoft YaHei");
+	assert.equal(searched[0].index, 0);
+});
+
+check("prefix matches sort above substring matches", () => {
+	const { buildRows } = I;
+	const families = [
+		{ name: "Noto Sans", zh: null, aliases: [], cjk: false, mono: false, serif: null },
+		{ name: "Sans Serif Pro", zh: null, aliases: [], cjk: false, mono: false, serif: null },
+	];
+	const rows = buildRows(families, "san", "latin", false, [], (key) => key);
+	assert.deepEqual(plain(rows.map((row) => row.family.name)), ["Sans Serif Pro", "Noto Sans"]);
+});
+
+await checkAsync("a family known under two names is inserted under both", async () => {
+	// The host catalogue reports the en-US family name with the localised one
+	// beside it; the field then carries both spellings so the stack resolves
+	// whichever of them the engine indexes.
+	const fetch = fetchStub({
+		families: [hostFamily("Microsoft YaHei", { zh: "微软雅黑", aliases: ["Microsoft YaHei", "微软雅黑"], cjk: true })],
+	});
+	const { render, tree } = bootSettingsPage({ fetch });
+	await new Promise((resolve) => setImmediate(resolve));
+	textInputs(tree)[0].props.onFocus();
+	const options = collect(render(), "button").filter((node) => node.props.role === "option");
+	assert.equal(optionLabel(options[0]), "微软雅黑");
+	options[0].props.onClick();
+	assert.equal(textInputs(render())[0].props.value, "微软雅黑, Microsoft YaHei");
+});
+
+// ---------------------------------------------------------------------------
+console.log("\n[host font parser]");
+
+/** A scratch directory for the synthetic font files. */
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-font-master-test-"));
+
+/**
+ * Write bytes to the scratch directory.
+ * @param name - file name.
+ * @param bytes - file contents.
+ * @returns the absolute path.
+ */
+function scratchFile(name, bytes) {
+	const target = path.join(scratch, name);
+	fs.writeFileSync(target, bytes);
+	return target;
+}
+
+await checkAsync("a single-face sfnt yields its family, localisation and aliases", async () => {
+	const file = scratchFile("single.ttf", buildFont({
+		legacyFamily: "Test Family",
+		zh: "测试字体",
+		subfamily: "Regular",
+		postScript: "TestFamily-Regular",
+		serifStyle: 4,
+		proportion: 4,
+	}));
+	const faces = await readFontFile(file);
+	assert.equal(faces.length, 1);
+	assert.equal(faces[0].name, "Test Family");
+	assert.equal(faces[0].zh, "测试字体");
+	assert.equal(faces[0].subfamily, "Regular");
+	assert.ok(faces[0].aliases.includes("Test Family"));
+	assert.ok(faces[0].aliases.includes("测试字体"), "the localisation must be searchable");
+	assert.ok(faces[0].aliases.includes("TestFamily-Regular"), "the PostScript name must be searchable");
+});
+
+await checkAsync("the typographic family name wins over the legacy one", async () => {
+	const file = scratchFile("typo.ttf", buildFont({ legacyFamily: "Legacy Name", family: "Typographic Name" }));
+	const faces = await readFontFile(file);
+	assert.equal(faces[0].name, "Typographic Name");
+	assert.ok(faces[0].aliases.includes("Legacy Name"), "the legacy name stays reachable as an alias");
+});
+
+await checkAsync("OS/2 classifies a CJK serif face", async () => {
+	const file = scratchFile("cjk.ttf", buildFont({ legacyFamily: "CJK Serif", cjk: true, serifStyle: 4 }));
+	const faces = await readFontFile(file);
+	assert.equal(faces[0].cjk, true);
+	assert.equal(faces[0].serif, true);
+	assert.equal(faces[0].mono, false);
+});
+
+await checkAsync("post.isFixedPitch decides monospacing, not PANOSE proportion", async () => {
+	// A CJK face declaring PANOSE proportion 9 (monospaced) but no fixed pitch is
+	// what SimHei and friends look like; PANOSE alone would mislabel them.
+	const misleading = scratchFile("pseudo-mono.ttf", buildFont({
+		legacyFamily: "Pseudo Mono", cjk: true, proportion: 9, fixedPitch: false,
+	}));
+	assert.equal((await readFontFile(misleading))[0].mono, false, "PANOSE proportion alone must not imply monospace");
+
+	const real = scratchFile("real-mono.ttf", buildFont({ legacyFamily: "Real Mono", proportion: 9, fixedPitch: true }));
+	assert.equal((await readFontFile(real))[0].mono, true);
+});
+
+await checkAsync("a ttcf collection yields one family per face", async () => {
+	const file = scratchFile("collection.ttc", buildCollection([
+		{ options: { legacyFamily: "Collection Sans", subfamily: "Regular" } },
+		{ options: { legacyFamily: "Collection Sans UI", subfamily: "Regular" } },
+	]));
+	const faces = await readFontFile(file);
+	assert.deepEqual(faces.map((face) => face.name), ["Collection Sans", "Collection Sans UI"]);
+	assert.deepEqual(faces.map((face) => face.subfamily), ["Regular", "Regular"]);
+});
+
+await checkAsync("a file that is not a font is skipped, not thrown on", async () => {
+	const junk = scratchFile("junk.ttf", Buffer.from("this is definitely not a font file"));
+	assert.deepEqual(await readFontFile(junk), []);
+	assert.deepEqual(await readFontFile(path.join(scratch, "missing.ttf")), []);
+});
+
+await checkAsync("enumerateFonts walks a directory, groups faces and caches the result", async () => {
+	const dir = path.join(scratch, "dir");
+	fs.mkdirSync(path.join(dir, "nested"), { recursive: true });
+	fs.writeFileSync(path.join(dir, "one.ttf"), buildFont({ legacyFamily: "One", subfamily: "Regular" }));
+	fs.writeFileSync(path.join(dir, "one-bold.ttf"), buildFont({ legacyFamily: "One", subfamily: "Bold" }));
+	fs.writeFileSync(path.join(dir, "nested", "two.ttc"), buildCollection([
+		{ options: { legacyFamily: "Two", subfamily: "Regular", cjk: true } },
+		{ options: { legacyFamily: "Three", subfamily: "Regular" } },
+	]));
+	// Not a font extension at all: must never be opened.
+	fs.writeFileSync(path.join(dir, "legacy.fon"), Buffer.from("nope"));
+
+	const cacheFile = path.join(scratch, "cache", "fonts.json");
+	const first = await enumerateFonts({ directories: [dir], cacheFile, refresh: true });
+	assert.equal(first.fileCount, 3, "the .fon file must not be counted");
+	assert.deepEqual(first.families.map((family) => family.name), ["One", "Three", "Two"]);
+	const one = first.families.find((family) => family.name === "One");
+	assert.deepEqual(plain(one.faces), ["Regular", "Bold"], "two files of one family collapse into one entry");
+	assert.equal(first.families.find((family) => family.name === "Two").cjk, true);
+	assert.equal(first.cached, false);
+
+	const second = await enumerateFonts({ directories: [dir], cacheFile });
+	assert.equal(second.cached, true, "an unchanged directory must reuse the cache");
+	assert.deepEqual(second.families, first.families);
+
+	// Adding a font changes the fingerprint, so the cache is discarded.
+	fs.writeFileSync(path.join(dir, "four.ttf"), buildFont({ legacyFamily: "Four" }));
+	const third = await enumerateFonts({ directories: [dir], cacheFile });
+	assert.equal(third.cached, false, "a new file must invalidate the cache");
+	assert.ok(third.families.some((family) => family.name === "Four"));
+});
+
+await checkAsync("a missing directory is tolerated", async () => {
+	const result = await enumerateFonts({ directories: [path.join(scratch, "nope")], refresh: true });
+	assert.deepEqual(plain(result.families), []);
+	assert.equal(result.fileCount, 0);
+});
+
+check("fontDirectories covers the platform's install locations", () => {
+	assert.deepEqual(plain(fontDirectories("win32", { WINDIR: "C:\\Windows", LOCALAPPDATA: "C:\\Users\\x\\AppData\\Local" }, "C:\\Users\\x")), [
+		"C:\\Windows\\Fonts",
+		"C:\\Users\\x\\AppData\\Local\\Microsoft\\Windows\\Fonts",
+	]);
+	assert.deepEqual(plain(fontDirectories("darwin", {}, "/Users/x")), [
+		"/System/Library/Fonts",
+		"/Library/Fonts",
+		"/Users/x/Library/Fonts",
+	]);
+	const linux = plain(fontDirectories("linux", {}, "/home/x"));
+	assert.ok(linux.includes("/usr/share/fonts"));
+	assert.ok(linux.includes("/home/x/.local/share/fonts"));
+	// The win32 default must not depend on the running machine's environment.
+	assert.ok(plain(fontDirectories("win32", {}, "C:\\Users\\x"))[0].endsWith("Fonts"));
+});
+
+fs.rmSync(scratch, { recursive: true, force: true });
 
 // ---------------------------------------------------------------------------
 console.log("\n[integration with the shipped ui-theme]");

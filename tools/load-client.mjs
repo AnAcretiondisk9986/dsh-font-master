@@ -16,20 +16,99 @@ import { fileURLToPath } from "node:url";
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
- * A React stub sufficient for module initialisation (nothing renders here).
- * @returns a stand-in for the `react` module.
+ * A stateful React stub, so the interactive parts of the settings page can
+ * actually be driven from Node: `useState` keeps its value between the manual
+ * re-renders the tests perform, and hooks are keyed by component identity the
+ * way React keys them by position in the tree.
+ *
+ * @returns the stub namespace and the re-entrant component renderer that keeps
+ *   hook cursors correct while nested components render.
  */
-export function reactStub() {
-	return {
-		createElement: (type, props, ...children) => ({ type, props, children }),
-		useState: (initial) => [initial, () => {}],
-		useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
-		useEffect: () => {},
-		useLayoutEffect: () => {},
-		useMemo: (fn) => fn(),
-		useCallback: (fn) => fn,
-		useRef: (value) => ({ current: value }),
+export function createReactStub() {
+	/** The component currently rendering. */
+	let rendering = null;
+	/** Position path of the component currently rendering. */
+	let renderingPath = "";
+	/** Hook cursor within the current component's render. */
+	let cursor = 0;
+	/**
+	 * Hook storage keyed by position path. Keying by path — not by component
+	 * identity — is what keeps two sibling instances of the same component (the
+	 * six pickers here) from sharing one state slot, which is how React behaves.
+	 */
+	const stores = new Map();
+
+	/** The hook array for the component being rendered. */
+	const currentStore = () => {
+		if (rendering === null) throw new Error("a hook ran outside renderComponent");
+		const entry = stores.get(renderingPath);
+		if (!entry || entry.component !== rendering) {
+			const fresh = { component: rendering, values: [] };
+			stores.set(renderingPath, fresh);
+			return fresh;
+		}
+		return entry;
 	};
+
+	const react = {
+		createElement: (type, props, ...children) => ({ type, props, children }),
+		useState(initial) {
+			const store = currentStore();
+			const index = cursor;
+			cursor += 1;
+			if (store.values.length <= index) {
+				store.values[index] = typeof initial === "function" ? initial() : initial;
+			}
+			/** Store the next value; the caller re-renders to observe it. */
+			const set = (next) => {
+				store.values[index] = typeof next === "function" ? next(store.values[index]) : next;
+			};
+			return [store.values[index], set];
+		},
+		useRef(initial) {
+			const store = currentStore();
+			const index = cursor;
+			cursor += 1;
+			if (store.values.length <= index) store.values[index] = { current: initial };
+			return store.values[index];
+		},
+		useSyncExternalStore(_subscribe, getSnapshot) {
+			return getSnapshot();
+		},
+		useEffect() {},
+		useLayoutEffect() {},
+		useMemo(fn) {
+			return fn();
+		},
+		useCallback(fn) {
+			return fn;
+		},
+	};
+
+	/**
+	 * Render one component with a fresh hook cursor, restoring the parent's.
+	 * @param component - the function component.
+	 * @param props - its props.
+	 * @param path - the component's position in the tree.
+	 * @returns whatever the component returned.
+	 */
+	const renderComponent = (component, props, path = "r") => {
+		const savedComponent = rendering;
+		const savedPath = renderingPath;
+		const savedCursor = cursor;
+		rendering = component;
+		renderingPath = path;
+		cursor = 0;
+		try {
+			return component(props);
+		} finally {
+			rendering = savedComponent;
+			renderingPath = savedPath;
+			cursor = savedCursor;
+		}
+	};
+
+	return { react, renderComponent };
 }
 
 /**
@@ -101,7 +180,7 @@ export function createFakeDom() {
 
 /**
  * Evaluate the browser half and return its exports.
- * @param options - optional `localStorage` map shared with the sandbox.
+ * @param options - optional `localStorage` map and `fetch` stub shared with the sandbox.
  * @returns the module entry, its exports, the raw source, the storage map and the fake DOM.
  */
 export function loadClient(options = {}) {
@@ -123,6 +202,7 @@ export function loadClient(options = {}) {
 		Boolean,
 		Math,
 		Error,
+		Promise,
 		document: dom.document,
 		window: {
 			localStorage: {
@@ -134,14 +214,16 @@ export function loadClient(options = {}) {
 			},
 		},
 	};
+	// The browser half reaches for `window.fetch`; tests supply their own.
+	if (typeof options.fetch === "function") sandbox.window.fetch = options.fetch;
 	sandbox.globalThis = sandbox;
 	vm.createContext(sandbox);
 	vm.runInContext(source, sandbox, { filename: "lib/client.js" });
 
 	if (!registration) throw new Error("lib/client.js did not register a module");
-	const react = reactStub();
+	const stub = createReactStub();
 	const exportsObject = registration.factory((name) => {
-		if (name === "react") return react;
+		if (name === "react") return stub.react;
 		throw new Error(`unexpected require: ${name}`);
 	});
 
@@ -152,6 +234,7 @@ export function loadClient(options = {}) {
 		internals: exportsObject.__internals,
 		storage: store,
 		dom,
+		renderComponent: stub.renderComponent,
 	};
 }
 
